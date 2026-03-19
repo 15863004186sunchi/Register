@@ -104,98 +104,103 @@ def register_single_thread():
             impersonates = list(dict.fromkeys(impersonates))
             
             for imp in impersonates:
-                with requests.Session(impersonate=imp, proxies=PROXIES) as session:
-                    # 预热连接
-                    try: session.get(site_url, timeout=10)
-                    except: pass
-
-                password = generate_random_string()
-
-                # 创建 DuckMail 临时邮箱
                 try:
-                    email, _duck_pwd, jwt = create_temp_email()
+                    with requests.Session(impersonate=imp, proxies=PROXIES) as session:
+                        # 预热连接
+                        try: session.get(site_url, timeout=10)
+                        except: pass
+
+                        password = generate_random_string()
+
+                        # 创建 DuckMail 临时邮箱
+                        try:
+                            email, _duck_pwd, jwt = create_temp_email()
+                        except Exception as e:
+                            print(f"[-] 邮箱服务抛出异常: {e}")
+                            email, jwt = None, None
+
+                        if not email:
+                            print(f"[-] 线程-{threading.get_ident()} 邮箱创建返回空，等待重试...")
+                            time.sleep(5); continue
+                        
+                        print(f"[*] 开始注册 ({imp}): {email}")
+
+                        # Step 1: 发送验证码
+                        if not send_email_code_grpc(session, email):
+                            # 发送验证码失败，可能是指纹不对，换下一个指纹尝试同一个邮箱（或者换个号）
+                            # 这里我们简单一点：跳过当前指纹，等下一轮
+                            continue
+                        
+                        # Step 2: 获取验证码 (DuckMail 自带轮询)
+                        code_with_dash = wait_for_verification_code(jwt, timeout=60)
+                        if code_with_dash:
+                            verify_code = code_with_dash.replace("-", "")
+                        else:
+                            verify_code = None
+                        
+                        if not verify_code:
+                            print(f"[-] {email} 未收到验证码")
+                            continue
+
+                        # Step 3: 验证验证码
+                        if not verify_email_code_grpc(session, email, verify_code):
+                            print(f"[-] {email} 验证码无效")
+                            continue
+                        
+                        # Step 4: 注册重试循环
+                        register_success = False
+                        for attempt in range(3):
+                            task_id = turnstile_service.create_task(site_url, config["site_key"])
+                            token = turnstile_service.get_response(task_id)
+                            
+                            if not token or token == "CAPTCHA_FAIL":
+                                continue
+
+                            headers = {
+                                "user-agent": user_agent, "accept": "text/x-component", "content-type": "text/plain;charset=UTF-8",
+                                "origin": site_url, "referer": f"{site_url}/sign-up", "cookie": f"__cf_bm={session.cookies.get('__cf_bm','')}",
+                                "next-router-state-tree": config["state_tree"],
+                            }
+                            if final_action_id:
+                                headers["next-action"] = final_action_id
+                            payload = [{
+                                "emailValidationCode": verify_code,
+                                "createUserAndSessionRequest": {
+                                    "email": email, "givenName": generate_random_name(), "familyName": generate_random_name(),
+                                    "clearTextPassword": password, "tosAcceptedVersion": "$undefined"
+                                },
+                                "turnstileToken": token, "promptOnDuplicateEmail": True
+                            }]
+                            
+                            with post_lock:
+                                res = session.post(f"{site_url}/sign-up", json=payload, headers=headers)
+                            
+                            if res.status_code == 200:
+                                match = re.search(r'(https://[^" \s]+set-cookie\?q=[^:" \s]+)1:', res.text)
+                                if match:
+                                    verify_url = match.group(1)
+                                    session.get(verify_url, allow_redirects=True)
+                                    sso = session.cookies.get("sso")
+                                    if sso:
+                                        with file_lock:
+                                            os.makedirs("keys", exist_ok=True)
+                                            with open("keys/grok.txt", "a") as f: f.write(sso + "\n")
+                                            with open("keys/accounts.txt", "a") as f: f.write(f"{email}:{password}:{sso}\n")
+                                            global success_count
+                                            success_count += 1
+                                            avg = (time.time() - start_time) / success_count
+                                            print(f"[✓] 注册成功: {email} | SSO: {sso[:15]}... | 平均: {avg:.1f}s")
+                                        register_success = True
+                                        break
+                            
+                            print(f"[-] {email} 提交失败 ({res.status_code})")
+                            time.sleep(3)
+                        
+                        if register_success:
+                            break # 跳出 impersonates 循环，去 while True 下一次
                 except Exception as e:
-                    print(f"[-] 邮箱服务抛出异常: {e}")
-                    email, jwt = None, None
-
-                if not email:
-                    print(f"[-] 线程-{threading.get_ident()} 邮箱创建返回空，可能接口挂了或超时，等待 5s...")
-                    time.sleep(5); continue
-                
-                print(f"[*] 开始注册: {email}")
-
-                # Step 1: 发送验证码
-                if not send_email_code_grpc(session, email):
-                    print(f"[-] {email} 发送验证码失败")
-                    time.sleep(5); continue
-                
-                # Step 2: 获取验证码 (DuckMail 自带轮询)
-                code_with_dash = wait_for_verification_code(jwt, timeout=60)
-                if code_with_dash:
-                    verify_code = code_with_dash.replace("-", "")
-                else:
-                    verify_code = None
-                if not verify_code:
-                    print(f"[-] {email} 未收到验证码")
+                    print(f"[-] 指纹 {imp} 线程异常: {e}")
                     continue
-
-                # Step 3: 验证验证码
-                if not verify_email_code_grpc(session, email, verify_code):
-                    print(f"[-] {email} 验证码无效")
-                    continue
-                
-                # Step 4: 注册重试循环
-                for attempt in range(3):
-                    task_id = turnstile_service.create_task(site_url, config["site_key"])
-                    # 这里不再打印获取 Token 的过程，只在失败时报错
-                    token = turnstile_service.get_response(task_id)
-                    
-                    if not token or token == "CAPTCHA_FAIL":
-                        print(f"[-] {email} CAPTCHA 失败，重试...")
-                        continue
-
-                    headers = {
-                        "user-agent": user_agent, "accept": "text/x-component", "content-type": "text/plain;charset=UTF-8",
-                        "origin": site_url, "referer": f"{site_url}/sign-up", "cookie": f"__cf_bm={session.cookies.get('__cf_bm','')}",
-                        "next-router-state-tree": config["state_tree"],
-                    }
-                    if final_action_id:
-                        headers["next-action"] = final_action_id
-                    payload = [{
-                        "emailValidationCode": verify_code,
-                        "createUserAndSessionRequest": {
-                            "email": email, "givenName": generate_random_name(), "familyName": generate_random_name(),
-                            "clearTextPassword": password, "tosAcceptedVersion": "$undefined"
-                        },
-                        "turnstileToken": token, "promptOnDuplicateEmail": True
-                    }]
-                    
-                    with post_lock:
-                        res = session.post(f"{site_url}/sign-up", json=payload, headers=headers)
-                    
-                    if res.status_code == 200:
-                        match = re.search(r'(https://[^" \s]+set-cookie\?q=[^:" \s]+)1:', res.text)
-                        if match:
-                            verify_url = match.group(1)
-                            session.get(verify_url, allow_redirects=True)
-                            sso = session.cookies.get("sso")
-                            if sso:
-                                with file_lock:
-                                    os.makedirs("keys", exist_ok=True)
-                                    with open("keys/grok.txt", "a") as f: f.write(sso + "\n")
-                                    with open("keys/accounts.txt", "a") as f: f.write(f"{email}:{password}:{sso}\n")
-                                    global success_count
-                                    success_count += 1
-                                    avg = (time.time() - start_time) / success_count
-                                    print(f"[✓] 注册成功: {email} | SSO: {sso[:15]}... | 平均: {avg:.1f}s")
-                                break  # 跳出 for 循环，继续 while True 注册下一个
-                    
-                    print(f"[-] {email} 提交失败 ({res.status_code})")
-                    time.sleep(3) # 失败稍微等一下
-                else:
-                    # 如果重试 3 次都失败 (for 循环没有被 break)
-                    print(f"[-] {email} 放弃，换号")
-                    time.sleep(5)
 
         except Exception as e:
             # 捕获所有异常防止线程退出
