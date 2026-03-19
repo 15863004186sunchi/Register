@@ -21,9 +21,9 @@ PROXIES = {
 
 # 动态获取的全局变量
 config = {
-    "site_key": "0x4AAAAAAAhr9JGVDZbrZOo0",
-    "action_id": None,
-    "state_tree": "%5B%22%22%2C%7B%22children%22%3A%5B%22(app)%22%2C%7B%22children%22%3A%5B%22(auth)%22%2C%7B%22children%22%3A%5B%22sign-up%22%2C%7B%22children%22%3A%5B%22__PAGE__%22%2C%7B%7D%2C%22%2Fsign-up%22%2C%22refresh%22%5D%7D%5D%7D%2Cnull%2Cnull%5D%7D%2Cnull%2Cnull%5D%7D%2Cnull%2Cnull%2Ctrue%5D"
+    "site_key": os.getenv("GROK_SITE_KEY", "0x4AAAAAAAhr9JGVDZbrZOo0"),
+    "action_id": os.getenv("GROK_ACTION_ID"),
+    "state_tree": os.getenv("GROK_STATE_TREE", "%5B%22%22%2C%7B%22children%22%3A%5B%22(app)%22%2C%7B%22children%22%3A%5B%22(auth)%22%2C%7B%22children%22%3A%5B%22sign-up%22%2C%7B%22children%22%3A%5B%22__PAGE__%22%2C%7B%7D%2C%22%2Fsign-up%22%2C%22refresh%22%5D%7D%5D%7D%2Cnull%2Cnull%5D%7D%2Cnull%2Cnull%5D%7D%2Cnull%2Cnull%2Ctrue%5D")
 }
 
 post_lock = threading.Lock()
@@ -202,41 +202,68 @@ def main():
     print("=" * 60 + "\nGrok 注册机\n" + "=" * 60)
     
     # 1. 扫描参数
-    print("[*] 正在初始化...")
-    start_url = f"{site_url}/sign-up"
-    with requests.Session(impersonate="chrome120") as s:
-        try:
-            html = s.get(start_url).text
-            # Key
-            key_match = re.search(r'sitekey":"(0x4[a-zA-Z0-9_-]+)"', html)
-            if key_match: config["site_key"] = key_match.group(1)
-            # Tree
-            tree_match = re.search(r'next-router-state-tree":"([^"]+)"', html)
-            if tree_match: config["state_tree"] = tree_match.group(1)
-            # Action ID
-            # 直接用正则从 HTML 抓取所有 /_next/static/chunks/*.js
-            js_urls = [urljoin(start_url, m.group(0)) for m in re.finditer(r"/_next/static/chunks/[^\"'\s>]+\.js", html)]
-            if not js_urls:
-                print(f"[Warn] HTML 长度 {len(html)}, 未解析出 JS，前500字符预览: {html[:500].replace('\n',' ')}")
-            action_found = None
-            for js_url in js_urls:
+    if config["action_id"]:
+        print(f"[!] 使用预设 Action ID: {config['action_id']}")
+    else:
+        print("[*] 正在扫描 Action ID (尝试解析页面)...")
+        start_url = f"{site_url}/sign-up"
+        # 尝试不同的浏览器指纹
+        impersonates = ["chrome110", "chrome120", "safari15_5", "firefox117", "edge101"]
+        action_found = None
+        
+        for imp in impersonates:
+            print(f"[*] 尝试指纹: {imp}...")
+            with requests.Session(impersonate=imp, proxies=PROXIES) as s:
                 try:
-                    js_content = s.get(js_url, timeout=15).text
+                    res = s.get(start_url, timeout=15)
+                    html = res.text
+                    if "Attention Required! | Cloudflare" in html or res.status_code == 403:
+                        print(f"[-] 指纹 {imp} 被 Cloudflare 拦截 (Status: {res.status_code})")
+                        continue
+                    
+                    # Key
+                    key_match = re.search(r'sitekey":"(0x4[a-zA-Z0-9_-]+)"', html)
+                    if key_match: 
+                        config["site_key"] = key_match.group(1)
+                        print(f"[+] 发现 Site Key: {config['site_key']}")
+                    
+                    # Tree
+                    tree_match = re.search(r'next-router-state-tree":"([^"]+)"', html)
+                    if tree_match: config["state_tree"] = tree_match.group(1)
+                    
+                    # Action ID
+                    js_urls = [urljoin(start_url, m.group(0)) for m in re.finditer(r"/_next/static/chunks/[^\"'\s>]+\.js", html)]
+                    if not js_urls:
+                        print(f"[Warn] 未解析出 JS 链接 (HTML 长度: {len(html)})")
+                        continue
+                        
+                    for js_url in js_urls:
+                        try:
+                            js_content = s.get(js_url, timeout=15).text
+                            match = re.search(r'7f[a-fA-F0-9]{40}', js_content)
+                            if match:
+                                action_found = match.group(0)
+                                print(f"[+] 成功获取 Action ID: {action_found}")
+                                break
+                        except Exception:
+                            continue
+                    
+                    if action_found:
+                        config["action_id"] = action_found
+                        break
                 except Exception as e:
+                    print(f"[-] 指纹 {imp} 请求失败: {e}")
                     continue
-                match = re.search(r'7f[a-fA-F0-9]{40}', js_content)
-                if match:
-                    action_found = match.group(0)
-                    print(f"[+] Action ID: {action_found}")
-                    break
-            if action_found:
-                config["action_id"] = action_found
-        except Exception as e:
-            print(f"[-] 初始化扫描失败: {e}")
-            return
 
     if not config["action_id"]:
-        print("[-] 错误: 未找到 Action ID")
+        print("\n" + "!" * 40)
+        print("[-] 错误: 无法获取 Action ID")
+        print("[!] 谷歌云机房 IP 可能已被 Cloudflare 深度封锁。")
+        print("[!] 建议手动方法:")
+        print("    1. 在浏览器打开 https://accounts.x.ai/sign-up")
+        print("    2. F12 搜索 JS 网络请求，查找包含 '7f...' (42位长度) 的字符串")
+        print("    3. 在 .env 文件中设置: GROK_ACTION_ID=你的ID")
+        print("!" * 40 + "\n")
         return
 
     # 2. 启动
