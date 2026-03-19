@@ -6,7 +6,7 @@ from curl_cffi import requests
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 
-from email_service import EmailService
+from email_register import create_temp_email, wait_for_verification_code
 from YesCaptcha_service import TurnstileService
 
 load_dotenv()
@@ -82,7 +82,6 @@ def register_single_thread():
     time.sleep(random.uniform(0, 5))
     
     try:
-        email_service = EmailService(proxies=PROXIES)
         turnstile_service = TurnstileService()
     except Exception as e:
         print(f"[-] 服务初始化失败: {e}")
@@ -102,13 +101,13 @@ def register_single_thread():
                 except: pass
 
                 password = generate_random_string()
-                
-                # print(f"[debug] 线程-{threading.get_ident()} 正在请求创建邮箱...")
+
+                # 创建 DuckMail 临时邮箱
                 try:
-                    jwt, email = email_service.create_email()
+                    email, _duck_pwd, jwt = create_temp_email()
                 except Exception as e:
                     print(f"[-] 邮箱服务抛出异常: {e}")
-                    jwt, email = None, None
+                    email, jwt = None, None
 
                 if not email:
                     print(f"[-] 线程-{threading.get_ident()} 邮箱创建返回空，可能接口挂了或超时，等待 5s...")
@@ -121,16 +120,12 @@ def register_single_thread():
                     print(f"[-] {email} 发送验证码失败")
                     time.sleep(5); continue
                 
-                # Step 2: 获取验证码
-                verify_code = None
-                for _ in range(30):
-                    time.sleep(1)
-                    content = email_service.fetch_first_email(jwt)
-                    if content:
-                        match = re.search(r">([A-Z0-9]{3}-[A-Z0-9]{3})<", content)
-                        if match:
-                            verify_code = match.group(1).replace("-", "")
-                            break
+                # Step 2: 获取验证码 (DuckMail 自带轮询)
+                code_with_dash = wait_for_verification_code(jwt, timeout=60)
+                if code_with_dash:
+                    verify_code = code_with_dash.replace("-", "")
+                else:
+                    verify_code = None
                 if not verify_code:
                     print(f"[-] {email} 未收到验证码")
                     continue
