@@ -23,7 +23,8 @@ PROXIES = {
 config = {
     "site_key": os.getenv("GROK_SITE_KEY", "0x4AAAAAAAhr9JGVDZbrZOo0"),
     "action_id": os.getenv("GROK_ACTION_ID"),
-    "state_tree": os.getenv("GROK_STATE_TREE", "%5B%22%22%2C%7B%22children%22%3A%5B%22(app)%22%2C%7B%22children%22%3A%5B%22(auth)%22%2C%7B%22children%22%3A%5B%22sign-up%22%2C%7B%22children%22%3A%5B%22__PAGE__%22%2C%7B%7D%2C%22%2Fsign-up%22%2C%22refresh%22%5D%7D%5D%7D%2Cnull%2Cnull%5D%7D%2Cnull%2Cnull%5D%7D%2Cnull%2Cnull%2Ctrue%5D")
+    "state_tree": os.getenv("GROK_STATE_TREE", "%5B%22%22%2C%7B%22children%22%3A%5B%22(app)%22%2C%7B%22children%22%3A%5B%22(auth)%22%2C%7B%22children%22%3A%5B%22sign-up%22%2C%7B%22children%22%3A%5B%22__PAGE__%22%2C%7B%7D%2C%22%2Fsign-up%22%2C%22refresh%22%5D%7D%5D%7D%2Cnull%2Cnull%5D%7D%2Cnull%2Cnull%5D%7D%2Cnull%2Cnull%2Ctrue%5D"),
+    "impersonate": "chrome120"
 }
 
 post_lock = threading.Lock()
@@ -56,10 +57,11 @@ def send_email_code_grpc(session, email):
     data = encode_grpc_message(1, email)
     headers = {"content-type": "application/grpc-web+proto", "x-grpc-web": "1", "x-user-agent": "connect-es/2.1.1", "origin": site_url, "referer": f"{site_url}/sign-up?redirect=grok-com"}
     try:
-        # print(f"[debug] {email} 正在发送验证码请求...")
         res = session.post(url, data=data, headers=headers, timeout=15)
-        # print(f"[debug] {email} 请求结束，状态码: {res.status_code}")
-        return res.status_code == 200
+        if res.status_code == 200:
+            return True
+        print(f"[-] {email} 发送验证码失败 (Status: {res.status_code}, Body: {res.text[:100]})")
+        return False
     except Exception as e:
         print(f"[-] {email} 发送验证码异常: {e}")
         return False
@@ -95,10 +97,17 @@ def register_single_thread():
     
     while True:
         try:
-            with requests.Session(impersonate="chrome120", proxies=PROXIES) as session:
-                # 预热连接
-                try: session.get(site_url, timeout=10)
-                except: pass
+            # 线程内循环尝试指纹，直到注册成功或达到最大重试
+            # 如果 main() 找到了一个可用的指纹，我们优先尝试它
+            impersonates = [config["impersonate"], "chrome110", "safari15_5", "firefox117", "edge101"]
+            # 去重
+            impersonates = list(dict.fromkeys(impersonates))
+            
+            for imp in impersonates:
+                with requests.Session(impersonate=imp, proxies=PROXIES) as session:
+                    # 预热连接
+                    try: session.get(site_url, timeout=10)
+                    except: pass
 
                 password = generate_random_string()
 
@@ -245,6 +254,7 @@ def main():
                     
                     if action_found:
                         config["action_id"] = action_found
+                        config["impersonate"] = imp  # 记住成功的指纹给线程使用
                         break
                 except Exception as e:
                     print(f"[-] 指纹 {imp} 请求失败: {e}")
